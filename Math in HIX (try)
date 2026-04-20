@@ -1,0 +1,123 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")  
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+matplotlib.rcParams['font.sans-serif'] = ['SimHei'] 
+matplotlib.rcParams['axes.unicode_minus'] = False 
+
+
+# ============================
+Hitachi F-7000 EEM
+# ============================
+def read_hitachi_eem(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+
+    if start_idx is None:
+        raise ValueError(f"未找到 'Peaks' 段落: {filepath}")
+
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1]
+            intensity = float(parts[2])
+            ex, em = ex_em.split('/')
+            data.append([float(ex), float(em), intensity])
+        except:
+            continue
+
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    return eem
+
+
+def calc_regions(eem):
+    regions = {}
+
+    # 区1
+    r1 = eem.loc[(eem.index >= 200) & (eem.index <= 250),
+                 (eem.columns >= 250) & (eem.columns <= 330)].mean().mean()
+    regions['R1'] = r1
+
+    # 区2
+    r2 = eem.loc[(eem.index >= 200) & (eem.index <= 250),
+                 (eem.columns >= 330) & (eem.columns <= 380)].mean().mean()
+    regions['R2'] = r2
+
+    # 区3
+    r3 = eem.loc[(eem.index >= 200) & (eem.index <= 250),
+                 (eem.columns >= 380) & (eem.columns <= 550)].mean().mean()
+    regions['R3'] = r3
+
+    # 区4
+    r4 = eem.loc[(eem.index >= 250) & (eem.index <= 380),
+                 (eem.columns >= 250) & (eem.columns <= 380)].mean().mean()
+    regions['R4'] = r4
+
+    # 区5
+    r5 = eem.loc[(eem.index >= 250) & (eem.index <= 450),
+                 (eem.columns >= 380) & (eem.columns <= 550)].mean().mean()
+    regions['R5'] = r5
+
+    # HIX
+    trend_index = (r3 + r5 - (r1 + r2 + r4)) / (r1 + r2 + r3 + r4 + r5)
+
+    return regions, trend_index
+
+folder = r"E:\desktop\1" 
+save_folder = os.path.join(folder, "RLI_figures")
+os.makedirs(save_folder, exist_ok=True)
+
+results = []
+
+for file in os.listdir(folder):
+    if not file.lower().endswith(".txt"):
+        continue
+    path = os.path.join(folder, file)
+    eem = read_hitachi_eem(path)
+    regions, trend_index = calc_regions(eem)
+    results.append([file, trend_index, regions['R1'], regions['R2'], regions['R3'], regions['R4'], regions['R5']])
+
+df_rli = pd.DataFrame(results, columns=["Sample", "HIX", "R1", "R2", "R3", "R4", "R5"])
+df_rli = df_rli.sort_values(by="HIX", ascending=False)
+
+plt.figure(figsize=(8, 5))
+sns.barplot(x="Sample", y="HIX", data=df_rli)
+plt.xticks(rotation=45, ha='right')
+plt.title("HIX")
+plt.ylabel("Trend Index = (R3+R5 - R1-R2-R4)/(R1+R2+R3+R4+R5)")
+plt.tight_layout()
+plt.savefig(os.path.join(save_folder, "HIX.png"), dpi=300)
+plt.close()
+
+df_long = df_rli.melt(id_vars=["Sample"], value_vars=["R1", "R2", "R3", "R4", "R5"],
+                      var_name="region", value_name="high")
+
+plt.figure(figsize=(10, 6))
+sns.barplot(x="Sample", y=high", hue="region", data=df_long)
+plt.xticks(rotation=45, ha='right')
+plt.title("compare")
+plt.ylabel("1")
+plt.legend(title="region")
+plt.tight_layout()
+plt.savefig(os.path.join(save_folder, "five region.png"), dpi=300)
+plt.close()
+
+print(f"done")
+print("\n sample HIX：")
+print(df_rli)
