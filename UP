@@ -1,0 +1,104 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+
+import matplotlib
+os.environ["MPLBACKEND"] = "Agg"
+matplotlib.use("Agg", force=True)
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+matplotlib.rcParams['font.sans-serif'] = ['SimHei']  # Chinese-capable font
+matplotlib.rcParams['axes.unicode_minus'] = False    # Fix minus sign rendering
+
+print("✅ Current Matplotlib backend:", matplotlib.get_backend())
+
+# ============================
+# 1️⃣ Read Hitachi F-7000 EEM
+# ============================
+def read_hitachi_eem(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+
+    if start_idx is None:
+        raise ValueError(f"'Peaks' section not found: {filepath}")
+
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1]
+            intensity = float(parts[2])
+            ex, em = ex_em.split('/')
+            data.append([float(ex), float(em), intensity])
+        except:
+            continue
+
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    return eem
+
+
+# ============================
+# 2️⃣ Calculate humification index (RLI)
+# ============================
+def calc_rli(eem, em_left=(250, 350), em_right=(400, 550)):
+    """Calculate Right-Light Left-Dark Index (RLI)."""
+    left = eem.loc[:, (eem.columns >= em_left[0]) & (eem.columns <= em_left[1])].mean().mean()
+    right = eem.loc[:, (eem.columns >= em_right[0]) & (eem.columns <= em_right[1])].mean().mean()
+    if (left + right) == 0:
+        return np.nan
+    rli = (right - left) / (right + left)
+    return rli, left, right
+
+
+# ============================
+# 3️⃣ Main program
+# ============================
+folder = r"E:\Desktop\EEM_data2" 
+results = []
+
+for file in os.listdir(folder):
+    if not file.lower().endswith(".txt"):
+        continue
+    path = os.path.join(folder, file)
+    eem = read_hitachi_eem(path)
+    rli, left, right = calc_rli(eem)
+    results.append([file, rli, left, right])
+
+df_rli = pd.DataFrame(results, columns=["Sample", "RLI", "Left_Intensity", "Right_Intensity"])
+df_rli = df_rli.sort_values(by="RLI", ascending=False)
+
+# ============================
+# 4️⃣ Visualize results
+# ============================
+plt.figure(figsize=(8, 5))
+sns.barplot(x="Sample", y="RLI", data=df_rli)
+plt.xticks(rotation=45, ha='right')
+plt.title("Humification Right-Light Left-Dark Index (RLI)")
+plt.ylabel("RLI = (Right - Left) / (Right + Left)")
+plt.tight_layout()
+
+output_path = os.path.join(folder, "RLI_result_plot.png")
+plt.savefig(output_path, dpi=300, bbox_inches="tight")
+plt.close()
+print(f"✅ Plot saved to: {output_path}")
+
+print("\nSample humification indices:")
+print(df_rli)
+
+
+
+
+
+
