@@ -1,0 +1,134 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+
+def read_hitachi_eem(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+    if start_idx is None:
+        return pd.DataFrame()
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1].replace(',', '').strip()
+            intensity = float(parts[2])
+            if '/' in ex_em:
+                ex, em = ex_em.split('/')
+            elif '\\' in ex_em:
+                ex, em = ex_em.split('\\')
+            else:
+                ex = parts[0]
+                em = parts[1]
+            data.append([float(ex), float(em), intensity])
+        except Exception:
+            continue
+    if len(data) == 0:
+        return pd.DataFrame()
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    eem.index = eem.index.astype(float)
+    eem.columns = eem.columns.astype(float)
+    eem = eem.sort_index(axis=0).sort_index(axis=1)
+    return eem
+
+def calc_HIX_normalized(eem, sample_name=None, fallback_log=None):
+    if fallback_log is None:
+        fallback_log = {}
+    sample_label = sample_name or 'unknown_sample'
+
+    if eem.empty:
+        fallback_log[sample_label] = [('all_nan', 'eem_empty')]
+        return np.nan, 'eem_empty'
+
+    ex_target = 254
+    if ex_target in eem.index:
+        row = eem.loc[ex_target]
+        method = 'direct'
+    else:
+        try:
+            eem_interp = eem.reindex(eem.index.union([ex_target])).sort_index()
+            eem_interp = eem_interp.interpolate(method='index', axis=0, limit_direction='both')
+            row = eem_interp.loc[ex_target]
+            method = 'interpolated'
+        except Exception:
+                # Fallback to nearest Ex
+            diffs = np.abs(eem.index.to_numpy() - ex_target)
+            nearest_ex = eem.index.to_numpy()[np.argmin(diffs)]
+            row = eem.loc[nearest_ex]
+            method = f'nearest({nearest_ex})'
+
+    low_range = (300, 345)
+    high_range = (435, 480)
+
+    low_vals = row[(row.index >= low_range[0]) & (row.index <= low_range[1])].dropna()
+    high_vals = row[(row.index >= high_range[0]) & (row.index <= high_range[1])].dropna()
+
+    if low_vals.empty or high_vals.empty:
+        # Try nearest non-empty small block
+        def nearest_block_mean(row, target_range):
+            cols = row.index.to_numpy()
+            diffs = np.abs(cols - np.mean(target_range))
+            order = np.argsort(diffs)
+            for c in cols[order]:
+                sub = row[(row.index >= c - 5) & (row.index <= c + 5)].dropna()
+                if not sub.empty:
+                    return sub.mean()
+            return None
+
+        low_mean = nearest_block_mean(row, low_range)
+        high_mean = nearest_block_mean(row, high_range)
+        if low_mean is None or high_mean is None:
+            global_mean = eem.stack().dropna().mean() if not eem.stack().dropna().empty else np.nan
+            fallback_log.setdefault(sample_label, []).append(('HIX_normalized', 'data_insufficient'))
+            return np.nan, 'data_insufficient'
+    else:
+        low_mean = low_vals.mean()
+        high_mean = high_vals.mean()
+
+    if (low_mean + high_mean) == 0:
+        fallback_log.setdefault(sample_label, []).append(('HIX_normalized', 'low+high_zero'))
+        return np.nan, 'low+high_zero'
+
+    HIX_norm = high_mean / (low_mean + high_mean)
+    return HIX_norm, method
+
+if __name__ == '__main__':
+    folder = r'E:\desktop\1'
+    save_folder = os.path.join(folder, 'Humification_results-HIXnorm')
+    os.makedirs(save_folder, exist_ok=True)
+
+    results = []
+    fallback_log = {}
+
+    for file in os.listdir(folder):
+        if not file.lower().endswith('.txt'):
+            continue
+        path = os.path.join(folder, file)
+        sample_label = os.path.splitext(file)[0]
+        try:
+            eem = read_hitachi_eem(path)
+            if eem.empty:
+                print(f'Warning: file is empty after reading: {file}')
+                results.append([file, np.nan, 'eem_empty'])
+                continue
+            HIX_norm, method = calc_HIX_normalized(eem, sample_name=sample_label, fallback_log=fallback_log)
+            results.append([file, HIX_norm, method])
+            print(f'Success: {sample_label}, HIX_normalized={HIX_norm}, Method={method}')
+        except Exception as e:
+            print(f'Error: {sample_label} calculation failed -> {e}')
+            results.append([file, np.nan, 'error'])
+
+    df = pd.DataFrame(results, columns=['Sample', 'HIX_normalized', 'Method'])
+    df.to_csv(os.path.join(save_folder, 'HIX_normalized_results_v3.csv'), index=False, encoding='utf-8-sig')
+
+    print(f'Success: all HIX_normalized results were saved to {save_folder}')
+    print(df.head())
