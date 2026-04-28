@@ -1,0 +1,114 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+def read_hitachi_eem(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+    if start_idx is None:
+        return pd.DataFrame()
+
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1].replace(',', '').strip()
+            intensity = float(parts[2])
+            if '/' in ex_em:
+                ex, em = ex_em.split('/')
+            elif '\\' in ex_em:
+                ex, em = ex_em.split('\\')
+            else:
+                ex = parts[0]
+                em = parts[1]
+            data.append([float(ex), float(em), intensity])
+        except Exception:
+            continue
+
+    if len(data) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    eem.index = eem.index.astype(float)
+    eem.columns = eem.columns.astype(float)
+    eem = eem.sort_index(axis=0).sort_index(axis=1)
+    return eem
+
+
+def calc_hix_normalized(eem, sample_name=None):
+    """
+    HIX_norm = I(435-480) / [I(300-345) + I(435-480)]
+    """
+    if eem.empty:
+        print(f"Warning: {sample_name} data is empty")
+        return np.nan
+
+    ex_target = 254
+    ex_values = eem.index.to_numpy()
+
+    if ex_target in ex_values:
+        row = eem.loc[ex_target]
+        used_ex = ex_target
+    else:
+        nearest_ex = ex_values[np.argmin(np.abs(ex_values - ex_target))]
+        row = eem.loc[nearest_ex]
+        used_ex = nearest_ex
+        print(f"Info: {sample_name} uses nearest Ex={nearest_ex} instead of 254 nm")
+
+    row = row.dropna()
+    low = row[(row.index >= 300) & (row.index <= 345)]
+    high = row[(row.index >= 435) & (row.index <= 480)]
+
+    if low.empty or high.empty:
+        print(f"Warning: {sample_name} has insufficient Em range data for HIX_normalized")
+        return np.nan
+
+    I_low = low.mean()
+    I_high = high.mean()
+    denom = I_low + I_high
+    if denom == 0:
+        print(f"Warning: {sample_name} has zero intensity and HIX_normalized cannot be calculated")
+        return np.nan
+
+    HIX_norm = I_high / denom
+    print(f"Success: {sample_name}, Ex={used_ex}, HIX_norm={HIX_norm:.4f}")
+    return HIX_norm
+
+
+if __name__ == "__main__":
+    folder = r"E:\desktop\1"  # Update this to your folder path.
+    save_folder = os.path.join(folder, "Humification_results-HIXnorm")
+    os.makedirs(save_folder, exist_ok=True)
+
+    results = []
+
+    for file in os.listdir(folder):
+        if not file.lower().endswith(".txt"):
+            continue
+        path = os.path.join(folder, file)
+        sample_label = os.path.splitext(file)[0]
+
+        try:
+            eem = read_hitachi_eem(path)
+            hix_norm = calc_hix_normalized(eem, sample_name=sample_label)
+            results.append([sample_label, hix_norm])
+        except Exception as e:
+            print(f"Warning: error while processing {file} -> {e}")
+            results.append([sample_label, np.nan])
+
+    df_hix = pd.DataFrame(results, columns=["Sample", "HIX_normalized"])
+    df_hix = df_hix.sort_values(by="HIX_normalized", ascending=False)
+    save_path = os.path.join(save_folder, "HIX_normalized_results.csv")
+    df_hix.to_csv(save_path, index=False, encoding="utf-8-sig")
+
+    print(f"\nSuccess: all HIX_normalized results were saved to {save_path}")
+    print(df_hix.head())
