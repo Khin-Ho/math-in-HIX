@@ -1,0 +1,24 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import os
+
+input_csv = r"E:\desktop\1\Humification_results-HIXnorm\HIX_normalized_with_R_final.csv"
+output_folder = r"E:\desktop\1\Humification_results-HIXnorm\ML_ready"
+os.makedirs(output_folder, exist_ok=True)
+df = pd.read_csv(input_csv)
+df = df.dropna(subset=['HIX_normalized'])
+feature_cols = ['R1', 'R2', 'R3', 'R4', 'R5']
+df[feature_cols] = df[feature_cols].fillna(df[feature_cols].mean())
+scaler = StandardScaler()
+df[feature_cols] = scaler.fit_transform(df[feature_cols])
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+train_csv = os.path.join(output_folder, 'train_ML.csv')
+test_csv = os.path.join(output_folder, 'test_ML.csv')
+
+train_df.to_csv(train_csv, index=False, encoding='utf-8-sig')
+test_df.to_csv(test_csv, index=False, encoding='utf-8-sig')
+
+print(f"Preprocessing complete. Train: {train_csv} Test: {test_csv}")
+print("Train sample:")
+print(train_df.head())
