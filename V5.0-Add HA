@@ -1,0 +1,156 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+# =========================
+# Read Hitachi EEM files
+# =========================
+def read_hitachi_eem(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+    if start_idx is None:
+        return pd.DataFrame()
+
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1].replace(',', '').strip()
+            intensity = float(parts[2])
+            if '/' in ex_em:
+                ex, em = ex_em.split('/')
+            elif '\\' in ex_em:
+                ex, em = ex_em.split('\\')
+            else:
+                ex = parts[0]
+                em = parts[1]
+            data.append([float(ex), float(em), intensity])
+        except Exception:
+            continue
+
+    if len(data) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    eem.index = eem.index.astype(float)
+    eem.columns = eem.columns.astype(float)
+    return eem.sort_index(axis=0).sort_index(axis=1)
+
+# =========================
+# Compute R1-R5 + HIX_normalized + HA/FA
+# =========================
+def calc_features(eem):
+    if eem.empty:
+        return {f"R{i}": np.nan for i in range(1, 6)}, np.nan, np.nan, np.nan
+
+    def mean_region(eem, ex_range, em_range):
+        sub = eem.loc[
+            (eem.index >= ex_range[0]) & (eem.index <= ex_range[1]),
+            (eem.columns >= em_range[0]) & (eem.columns <= em_range[1])
+        ]
+        if sub.empty or sub.stack().dropna().empty:
+            return np.nan
+        return sub.mean().mean()
+
+    regions = {
+        "R1": mean_region(eem, (200, 250), (250, 330)),
+        "R2": mean_region(eem, (200, 250), (330, 380)),
+        "R3": mean_region(eem, (200, 250), (380, 550)),
+        "R4": mean_region(eem, (250, 380), (250, 380)),
+        "R5": mean_region(eem, (250, 450), (380, 550)),
+    }
+
+    ex_target = 254
+    if ex_target in eem.index:
+        row = eem.loc[ex_target]
+    else:
+        eem_interp = eem.reindex(eem.index.union([ex_target])).sort_index()
+        eem_interp = eem_interp.interpolate(method='index', axis=0, limit_direction='both')
+        row = eem_interp.loc[ex_target]
+
+    # FA: 300–345 nm, HA: 435–480 nm
+    FA_vals = row[(row.index >= 300) & (row.index <= 345)].dropna()
+    HA_vals = row[(row.index >= 435) & (row.index <= 480)].dropna()
+
+    FA = FA_vals.mean() if not FA_vals.empty else np.nan
+    HA = HA_vals.mean() if not HA_vals.empty else np.nan
+
+    if (HA is np.nan or FA is np.nan) or (HA + FA == 0):
+        HIX_norm = np.nan
+    else:
+        HIX_norm = HA / (HA + FA)
+
+    return regions, HIX_norm, HA, FA
+
+# =========================
+# Robust sample condition parsing (supports letters in sample name)
+# =========================
+def parse_sample_conditions(sample_label):
+    PS = KOH = Microwave = 0.0
+    pattern = r'(\d+\.?\d*)\+(\d+\.?\d*)(?:\+(\d+\.?\d*))?'
+    match = re.search(pattern, sample_label)
+    if match:
+        PS = float(match.group(1))
+        KOH = float(match.group(2))
+        Microwave = float(match.group(3)) if match.group(3) else 0.0
+    return PS, KOH, Microwave
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    folder = r"E:\桌面\5"  # EEM folder path
+    save_folder = os.path.join(folder, "ML_ready")
+    os.makedirs(save_folder, exist_ok=True)
+
+    results = []
+
+    for file in os.listdir(folder):
+        if not file.lower().endswith(".txt"):
+            continue
+        path = os.path.join(folder, file)
+        sample_label = os.path.splitext(file)[0]
+
+        try:
+            eem = read_hitachi_eem(path)
+            regions, HIX_norm, HA, FA = calc_features(eem)
+            PS, KOH, Microwave = parse_sample_conditions(sample_label)
+            row = [sample_label, PS, KOH, Microwave, HIX_norm, HA, FA] + [regions[f"R{i}"] for i in range(1, 6)]
+            results.append(row)
+            print(f"OK {sample_label}: PS={PS}, KOH={KOH}, Microwave={Microwave}, HIX_norm={HIX_norm}")
+        except Exception as e:
+            print(f"ERR {sample_label}: error -> {e}")
+            results.append([sample_label, 0, 0, 0, np.nan, np.nan, np.nan] + [np.nan]*5)
+
+    df = pd.DataFrame(results, columns=[
+        "Sample", "PS", "KOH", "Microwave", "HIX_normalized", "HA", "FA",
+        "R1", "R2", "R3", "R4", "R5"
+    ])
+
+    # Missing value handling
+    df = df.dropna(subset=["HIX_normalized"])
+    for col in ["R1", "R2", "R3", "R4", "R5", "HA", "FA"]:
+        df[col] = df[col].fillna(df[col].mean())
+
+    # Feature standardization
+    scaler = StandardScaler()
+    feature_cols = ["R1", "R2", "R3", "R4", "R5", "HA", "FA", "PS", "KOH", "Microwave"]
+    df[feature_cols] = scaler.fit_transform(df[feature_cols])
+
+    # Save CSV
+    save_path = os.path.join(save_folder, "HIX_with_HA_FA.csv")
+    df.to_csv(save_path, index=False, encoding="utf-8-sig")
+
+    print(f"\nOK CSV generated: {save_path}")
+    print(df.head())
