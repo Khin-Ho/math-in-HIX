@@ -1,0 +1,252 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+# =========================
+# Read Hitachi EEM file
+# =========================
+def read_hitachi_eem(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+    if start_idx is None:
+        return pd.DataFrame()
+
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1].replace(',', '').strip()
+            intensity = float(parts[2])
+            if '/' in ex_em:
+                ex, em = ex_em.split('/')
+            elif '\\' in ex_em:
+                ex, em = ex_em.split('\\')
+            else:
+                ex = parts[0]
+                em = parts[1]
+            data.append([float(ex), float(em), intensity])
+        except Exception:
+            # Skip unparseable lines
+            continue
+
+    if len(data) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    # Ensure index/columns are float and sorted
+    try:
+        eem.index = eem.index.astype(float)
+        eem.columns = eem.columns.astype(float)
+    except Exception:
+        pass
+    return eem.sort_index(axis=0).sort_index(axis=1)
+
+# =========================
+# Calculate FRI regions & HIX
+# =========================
+def calc_features(eem):
+    """
+    Returns:
+        regions: dict R1..R5 -> integrated volume (or np.nan)
+        percents: dict P1..P5 -> percent share (or np.nan)
+        Phi_T: total integral (or np.nan)
+        HIX_norm: normalized HIX (or np.nan)
+    """
+    # Initialize defaults
+    regions = {f"R{i}": np.nan for i in range(1, 6)}
+    percents = {f"P{i}": np.nan for i in range(1, 6)}
+    Phi_T = np.nan
+    HIX_norm = np.nan
+
+    if eem.empty:
+        return regions, percents, Phi_T, HIX_norm
+
+    # Compute Ex/Em step sizes (guard for single/irregular points)
+    try:
+        ex_diffs = np.diff(eem.index)
+        em_diffs = np.diff(eem.columns)
+        Δλ_ex = np.mean(ex_diffs) if len(ex_diffs) > 0 else 1.0
+        Δλ_em = np.mean(em_diffs) if len(em_diffs) > 0 else 1.0
+    except Exception:
+        Δλ_ex = 1.0
+        Δλ_em = 1.0
+
+    # Region integration (robust)
+    def integrate_region(eem, ex_range, em_range):
+        try:
+            sub = eem.loc[
+                (eem.index >= ex_range[0]) & (eem.index <= ex_range[1]),
+                (eem.columns >= em_range[0]) & (eem.columns <= em_range[1])
+            ]
+            if sub.empty or sub.stack().dropna().empty:
+                return np.nan
+            # Integral (sum of intensities * step sizes)
+            return sub.sum().sum() * Δλ_ex * Δλ_em
+        except Exception:
+            return np.nan
+
+    # Five regions (keep original boundaries)
+    regions["R1"] = integrate_region(eem, (200, 250), (280, 330))
+    regions["R2"] = integrate_region(eem, (200, 250), (330, 380))
+    regions["R3"] = integrate_region(eem, (200, 250), (380, 550))
+    regions["R4"] = integrate_region(eem, (250, 380), (250, 380))
+    regions["R5"] = integrate_region(eem, (250, 450), (380, 550))
+
+    # Total integral
+    # Use np.nansum to ignore NaN regions
+    Phi_T = np.nansum([v for v in regions.values() if not pd.isna(v)])
+    if np.isfinite(Phi_T) and Phi_T > 0:
+        for i in range(1, 6):
+            val = regions.get(f"R{i}", np.nan)
+            percents[f"P{i}"] = (val / Phi_T) * 100 if (not pd.isna(val)) else np.nan
+    else:
+        percents = {f"P{i}": np.nan for i in range(1, 6)}
+
+    # =========================
+    # HIX (mean intensity method, literature: Ex≈254)
+    # =========================
+    try:
+        ex_target = 254
+        if ex_target in eem.index:
+            row = eem.loc[ex_target]
+        else:
+            # Interpolate a row or choose the nearest row
+            try:
+                eem_interp = eem.reindex(eem.index.union([ex_target])).sort_index()
+                eem_interp = eem_interp.interpolate(method='index', axis=0, limit_direction='both')
+                row = eem_interp.loc[ex_target]
+            except Exception:
+                diffs = np.abs(eem.index.to_numpy() - ex_target)
+                nearest_ex = eem.index.to_numpy()[np.argmin(diffs)]
+                row = eem.loc[nearest_ex]
+
+        low_vals = row[(row.index >= 300) & (row.index <= 345)].dropna()
+        high_vals = row[(row.index >= 435) & (row.index <= 480)].dropna()
+
+        if (not low_vals.empty) and (not high_vals.empty):
+            low_mean = low_vals.mean()
+            high_mean = high_vals.mean()
+            if (low_mean + high_mean) != 0:
+                HIX_norm = high_mean / (low_mean + high_mean)
+            else:
+                HIX_norm = np.nan
+        else:
+            HIX_norm = np.nan
+    except Exception:
+        HIX_norm = np.nan
+
+    return regions, percents, Phi_T, HIX_norm
+
+# =========================
+# Parse sample conditions
+# =========================
+def parse_sample_conditions(sample_label):
+    PS, KOH, Microwave = 0.0, 0.0, 0.0
+    pattern = r'(\d+\.?\d*)\+(\d+\.?\d*)(?:\+(\d+\.?\d*))?'
+    match = re.search(pattern, sample_label)
+    if match:
+        try:
+            PS = float(match.group(1))
+            KOH = float(match.group(2))
+            Microwave = float(match.group(3)) if match.group(3) else 0.0
+        except Exception:
+            PS, KOH, Microwave = 0.0, 0.0, 0.0
+    return PS, KOH, Microwave
+
+# =========================
+# Main program
+# =========================
+if __name__ == "__main__":
+    folder = r"E:\桌面\3"   # <-- Modify as needed
+    save_folder = os.path.join(folder, "ML_ready")
+    os.makedirs(save_folder, exist_ok=True)
+
+    results = []
+
+    for file in os.listdir(folder):
+        if not file.lower().endswith(".txt"):
+            continue
+        path = os.path.join(folder, file)
+        sample_label = os.path.splitext(file)[0]
+
+        try:
+            eem = read_hitachi_eem(path)
+            regions, percents, Phi_T, HIX_norm = calc_features(eem)
+            PS, KOH, Microwave = parse_sample_conditions(sample_label)
+
+            # Keep consistent column count (even if some values are np.nan)
+            row = [
+                sample_label,
+                PS,
+                KOH,
+                Microwave,
+                HIX_norm,
+                Phi_T,
+                regions.get("R1", np.nan),
+                regions.get("R2", np.nan),
+                regions.get("R3", np.nan),
+                regions.get("R4", np.nan),
+                regions.get("R5", np.nan),
+                percents.get("P1", np.nan),
+                percents.get("P2", np.nan),
+                percents.get("P3", np.nan),
+                percents.get("P4", np.nan),
+                percents.get("P5", np.nan),
+            ]
+            results.append(row)
+            print(f"✅ {sample_label}: HIX_norm={HIX_norm}, Phi_T={Phi_T}")
+
+        except Exception as e:
+            print(f"❌ {sample_label}: Error -> {e}")
+            results.append([sample_label, 0.0, 0.0, 0.0, np.nan, np.nan] + [np.nan]*10)
+
+    # =========================
+    # DataFrame & post-processing
+    # =========================
+    cols = [
+        "Sample","PS","KOH","Microwave","HIX_normalized","Phi_T",
+        "R1","R2","R3","R4","R5",
+        "P1","P2","P3","P4","P5"
+    ]
+    df = pd.DataFrame(results, columns=cols)
+
+    # Drop rows missing the target (HIX)
+    df = df.dropna(subset=["HIX_normalized"]).reset_index(drop=True)
+
+    if df.shape[0] == 0:
+        print("⚠️ No usable samples (all HIX missing). CSV not generated.")
+    else:
+        # Fill missing feature values (explicit assignment to avoid chained assignment warnings)
+        for col in ["R1","R2","R3","R4","R5"]:
+            if col in df.columns:
+                mean_val = df[col].mean()
+                df[col] = df[col].fillna(mean_val)
+
+        # Check feature columns before standardization
+        feature_cols = ["R1","R2","R3","R4","R5","PS","KOH","Microwave"]
+        # Ensure required columns exist (create as 0 if missing)
+        for c in feature_cols:
+            if c not in df.columns:
+                df[c] = 0.0
+
+        if df[feature_cols].shape[0] > 0:
+            scaler = StandardScaler()
+            df[feature_cols] = scaler.fit_transform(df[feature_cols])
+        else:
+            print("⚠️ No samples to standardize; skipping standardization.")
+
+        save_path = os.path.join(save_folder, "HIX_FRI_fixed.csv")
+        df.to_csv(save_path, index=False, encoding="utf-8-sig")
+        print(f"\n✅ CSV generated: {save_path}")
+        print(f"Samples: {df.shape[0]}, Columns: {df.shape[1]}")
+        print(df.head())
