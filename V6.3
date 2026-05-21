@@ -1,0 +1,218 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
+# =========================
+# 读取 Hitachi EEM 文件
+# =========================
+def read_hitachi_eem(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+
+    if start_idx is None:
+        return pd.DataFrame()
+
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1].replace(',', '').strip()
+            intensity = float(parts[2])
+
+            if '/' in ex_em:
+                ex, em = ex_em.split('/')
+            elif '\\' in ex_em:
+                ex, em = ex_em.split('\\')
+            else:
+                ex = parts[0]
+                em = parts[1]
+
+            data.append([float(ex), float(em), intensity])
+        except:
+            continue
+
+    if len(data) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    # Ensure numeric index/columns
+    eem.index = eem.index.astype(float)
+    eem.columns = eem.columns.astype(float)
+    return eem.sort_index(axis=0).sort_index(axis=1)
+
+
+# =========================
+# 积分式计算 R1-R5 + HIX（同时返回 raw 和 normalized）
+# =========================
+def calc_features(eem, delta_ex=5, delta_em=5):
+    """
+    返回:
+      regions_dict, HIX_raw, HIX_norm
+    HIX_raw = A / B  (可能会很大)
+    HIX_norm = A / (A + B) (归一化，范围 [0,1])
+    """
+    if eem.empty:
+        return {f"R{i}": np.nan for i in range(1, 6)}, np.nan, np.nan
+
+    cell_area = delta_ex * delta_em
+
+    # 区域积分函数（积分结果 = Σ intensity × Δλex × Δλem）
+    def integrate_region(eem, ex_range, em_range):
+        sub = eem.loc[
+            (eem.index >= ex_range[0]) & (eem.index <= ex_range[1]),
+            (eem.columns >= em_range[0]) & (eem.columns <= em_range[1])
+        ]
+        if sub.empty:
+            return np.nan
+        return sub.sum().sum() * cell_area
+
+    regions = {
+        "R1": integrate_region(eem, (200, 250), (250, 330)),
+        "R2": integrate_region(eem, (200, 250), (330, 380)),
+        "R3": integrate_region(eem, (200, 250), (380, 550)),
+        "R4": integrate_region(eem, (250, 380), (250, 380)),
+        "R5": integrate_region(eem, (250, 450), (380, 550)),
+    }
+
+    # HIX: 基于 exc = 254 nm 的 emission 行
+    ex_target = 254.0
+    if ex_target in eem.index:
+        row = eem.loc[ex_target]
+    else:
+        # 先尝试在 ex 方向插值到 254
+        try:
+            eem_interp = eem.reindex(eem.index.union([ex_target])).sort_index()
+            eem_interp = eem_interp.interpolate(method='index', axis=0, limit_direction='both')
+            row = eem_interp.loc[ex_target]
+        except Exception:
+            # 最后退回到最近的 ex
+            nearest_ex = eem.index[np.argmin(np.abs(eem.index - ex_target))]
+            row = eem.loc[nearest_ex]
+
+    # 抽取 emission 区间并去 NaN
+    low_vals = row[(row.index >= 300) & (row.index <= 345)].dropna()
+    high_vals = row[(row.index >= 435) & (row.index <= 480)].dropna()
+
+    # 如果任一区间没有数据，则无法计算 HIX
+    if low_vals.empty or high_vals.empty:
+        return regions, np.nan, np.nan
+
+    # 积分（Σ intensity × Δλ_em） -> A = high_int, B = low_int
+    low_int = low_vals.sum() * delta_em   # B
+    high_int = high_vals.sum() * delta_em  # A
+
+    # HIX_raw (A/B) — 仅当 B != 0 时有效
+    HIX_raw = np.nan
+    if low_int != 0:
+        HIX_raw = high_int / low_int
+
+    # HIX_norm (A/(A+B)) — 归一化到 [0,1]
+    if (high_int + low_int) == 0:
+        HIX_norm = np.nan
+    else:
+        HIX_norm = high_int / (high_int + low_int)
+
+    return regions, HIX_raw, HIX_norm
+
+
+# =========================
+# 解析样品标签
+# =========================
+def parse_sample_conditions(sample_label):
+    PS, KOH, Microwave = 0.0, 0.0, 0.0
+    pattern = r'(\d+\.?\d*)\+(\d+\.?\d*)(?:\+(\d+\.?\d*))?'
+    match = re.search(pattern, sample_label)
+    if match:
+        PS = float(match.group(1))
+        KOH = float(match.group(2))
+        Microwave = float(match.group(3)) if match.group(3) else 0.0
+    return PS, KOH, Microwave
+
+
+# =========================
+# 主程序
+# =========================
+if __name__ == "__main__":
+    folder = r"E:\桌面\1"   # 修改为你的文件夹
+    save_folder = os.path.join(folder, "ML_ready")
+    os.makedirs(save_folder, exist_ok=True)
+
+    results = []
+
+    for file in os.listdir(folder):
+        if not file.lower().endswith(".txt"):
+            continue
+
+        path = os.path.join(folder, file)
+        sample_label = os.path.splitext(file)[0]
+
+        try:
+            eem = read_hitachi_eem(path)
+            regions, hix_raw, hix_norm = calc_features(eem, delta_ex=5, delta_em=5)
+            PS, KOH, Microwave = parse_sample_conditions(sample_label)
+
+            row = [
+                sample_label, PS, KOH, Microwave,
+                regions.get("R1", np.nan), regions.get("R2", np.nan),
+                regions.get("R3", np.nan), regions.get("R4", np.nan),
+                regions.get("R5", np.nan),
+                hix_raw, hix_norm
+            ]
+            results.append(row)
+            print(f"✅ {sample_label}: HIX_raw={hix_raw}, HIX_norm={hix_norm}")
+
+        except Exception as e:
+            print(f"❌ {sample_label} 出错: {e}")
+            results.append([sample_label, 0.0, 0.0, 0.0] + [np.nan]*5 + [np.nan, np.nan])
+
+    # DataFrame — 列顺序清晰（R1..R5 在 HIX 前）
+    cols = [
+        "Sample", "PS", "KOH", "Microwave",
+        "R1", "R2", "R3", "R4", "R5",
+        "HIX_raw", "HIX_normalized"
+    ]
+    df = pd.DataFrame(results, columns=cols)
+
+    # 报告有多少样品 HIX 无法计算（供你排查）
+    n_nan = df["HIX_normalized"].isna().sum()
+    total = len(df)
+    print(f"\n样品总数: {total}，无法计算 HIX_normalized 的样品数: {n_nan}")
+
+    # 如果你希望只保留能计算 HIX 的样品用于训练，可以 dropna(subset=["HIX_normalized"])
+    # 但先我们不自动删除，保留供诊断。下面示例把要训练的 DataFrame 另存 train_df
+    train_df = df.dropna(subset=["HIX_normalized"]).copy()
+
+    # -------- 区域特征缺失值填补（在训练集中） --------
+    for col in ["R1", "R2", "R3", "R4", "R5"]:
+        if col in train_df.columns:
+            # 用训练集中均值填充训练集的 NaN
+            mean_val = train_df[col].mean()
+            train_df[col] = train_df[col].fillna(mean_val)
+
+    # -------- 特征标准化（仅对训练集做标准化） --------
+    feature_cols = ["R1", "R2", "R3", "R4", "R5", "PS", "KOH", "Microwave"]
+    scaler_feat = StandardScaler()
+    # 仅在训练集中进行 fit_transform（避免包含 nan）
+    # 首先确保 PS/KOH/Microwave 没有 NaN（它们默认被解析为 0）
+    train_df[feature_cols] = scaler_feat.fit_transform(train_df[feature_cols])
+
+    # 保存两个 CSV：全部样品（供诊断）与训练集（用于建模）
+    df_path_all = os.path.join(save_folder, "HIX_all_samples.csv")
+    df.to_csv(df_path_all, index=False, encoding="utf-8-sig")
+
+    df_path_train = os.path.join(save_folder, "HIX_train_ready.csv")
+    train_df.to_csv(df_path_train, index=False, encoding="utf-8-sig")
+
+    print(f"\n✅ CSV 保存:\n - All samples: {df_path_all}\n - Train-ready: {df_path_train}")
+    print(df.head())
