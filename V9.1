@@ -1,0 +1,252 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+from scipy.signal import savgol_filter
+from sklearn.preprocessing import StandardScaler
+
+
+# =========================
+# 解析样品名中的 PS / KOH / Microwave
+# =========================
+def parse_sample_conditions(name):
+    """
+    自动从文件名中解析 PS, KOH, MW（Microwave）
+    支持格式：
+    PS10_KOH20_MW5
+    PS3-KOH5-MW2
+    Sample_PS5KOH10MW0
+    PS8 KOH0 MW10
+    """
+
+    PS = 0
+    KOH = 0
+    MW = 0
+
+    # PS
+    m = re.search(r"PS\s*([0-9]+(?:\.[0-9]+)?)", name, flags=re.IGNORECASE)
+    if m:
+        PS = float(m.group(1))
+
+    # KOH
+    m = re.search(r"KOH\s*([0-9]+(?:\.[0-9]+)?)", name, flags=re.IGNORECASE)
+    if m:
+        KOH = float(m.group(1))
+
+    # MW 或 Microwave
+    m = re.search(r"(MW|Microwave)\s*([0-9]+(?:\.[0-9]+)?)", name, flags=re.IGNORECASE)
+    if m:
+        MW = float(m.group(2))
+
+    return PS, KOH, MW
+
+
+# =========================
+# 瑞利散射去除
+# =========================
+def remove_rayleigh_scatter(eem, width=20):
+    eem_clean = eem.copy()
+    ex = eem_clean.index.values
+    em = eem_clean.columns.values
+
+    for ex_i in ex:
+        mask1 = (em >= ex_i - width) & (em <= ex_i + width)
+        eem_clean.loc[ex_i, mask1] = np.nan
+
+        mask2 = (em >= 2 * ex_i - width) & (em <= 2 * ex_i + width)
+        eem_clean.loc[ex_i, mask2] = np.nan
+    return eem_clean
+
+
+# =========================
+# NaN 插值
+# =========================
+def interpolate_eem(eem):
+    eem_interp = eem.interpolate(method='linear', axis=1, limit_direction='both')
+    eem_interp = eem_interp.interpolate(method='linear', axis=0, limit_direction='both')
+    return eem_interp
+
+
+# =========================
+# Savitzky–Golay 平滑
+# =========================
+def smooth_eem(eem, window=7, poly=3):
+    arr = eem.values
+    smooth_arr = savgol_filter(arr, window_length=window, polyorder=poly, axis=1, mode='interp')
+    return pd.DataFrame(smooth_arr, index=eem.index, columns=eem.columns)
+
+
+# =========================
+# 尖峰噪声去除（3σ）
+# =========================
+def remove_spikes(eem):
+    arr = eem.values
+    mean = np.nanmean(arr)
+    std = np.nanstd(arr)
+    threshold = mean + 3 * std
+    arr[arr > threshold] = threshold
+    return pd.DataFrame(arr, index=eem.index, columns=eem.columns)
+
+
+# =========================
+# Raman Normalization
+# =========================
+def raman_normalize(eem):
+    total_intensity = eem.sum().sum()
+    if total_intensity == 0:
+        return eem
+    return eem / total_intensity
+
+
+# =========================
+# 读取 Hitachi EEM 文件
+# =========================
+def read_hitachi_eem(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+    if start_idx is None:
+        return pd.DataFrame()
+
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1].replace(',', '').strip()
+            intensity = float(parts[2])
+
+            if '/' in ex_em:
+                ex, em = ex_em.split('/')
+            elif '\\' in ex_em:
+                ex, em = ex_em.split('\\')
+            else:
+                ex = parts[0]
+                em = parts[1]
+
+            data.append([float(ex), float(em), intensity])
+        except:
+            continue
+
+    if len(data) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    eem.index = eem.index.astype(float)
+    eem.columns = eem.columns.astype(float)
+    return eem.sort_index(axis=0).sort_index(axis=1)
+
+
+# =========================
+# 计算 R1-R5 + HIX
+# =========================
+def calc_features(eem):
+    if eem.empty:
+        return {f"R{i}": np.nan for i in range(1, 6)}, np.nan
+
+    def mean_region(eem, ex_range, em_range):
+        sub = eem.loc[
+            (eem.index >= ex_range[0]) & (eem.index <= ex_range[1]),
+            (eem.columns >= em_range[0]) & (eem.columns <= em_range[1])
+        ]
+        if sub.empty or sub.stack().dropna().empty:
+            return np.nan
+        return sub.mean().mean()
+
+    regions = {
+        "R1": mean_region(eem, (200, 250), (250, 330)),
+        "R2": mean_region(eem, (200, 250), (330, 380)),
+        "R3": mean_region(eem, (200, 250), (380, 550)),
+        "R4": mean_region(eem, (250, 380), (250, 380)),
+        "R5": mean_region(eem, (250, 450), (380, 550)),
+    }
+
+    ex_target = 254
+    if ex_target in eem.index:
+        row = eem.loc[ex_target]
+    else:
+        eem_interp = eem.reindex(eem.index.union([ex_target])).sort_index()
+        eem_interp = eem_interp.interpolate(method='index', axis=0, limit_direction='both')
+        row = eem_interp.loc[ex_target]
+
+    low_vals = row[(row.index >= 300) & (row.index <= 345)].dropna()
+    high_vals = row[(row.index >= 435) & (row.index <= 480)].dropna()
+    if low_vals.empty or high_vals.empty:
+        return regions, np.nan
+
+    low_sum = low_vals.sum()
+    high_sum = high_vals.sum()
+    if (low_sum + high_sum) == 0:
+        return regions, np.nan
+
+    HIX_norm = high_sum / (low_sum + high_sum)
+    return regions, HIX_norm
+
+
+# =========================
+# 主程序（整合所有预处理）
+# =========================
+if __name__ == "__main__":
+
+    folder = r"E:\桌面\0"
+    save_folder = os.path.join(folder, "ML_ready")
+    os.makedirs(save_folder, exist_ok=True)
+
+    results = []
+
+    for file in os.listdir(folder):
+        if not file.lower().endswith(".txt"):
+            continue
+
+        path = os.path.join(folder, file)
+        sample_label = os.path.splitext(file)[0]
+
+        try:
+            eem = read_hitachi_eem(path)
+
+            # 全部预处理
+            eem = remove_rayleigh_scatter(eem)
+            eem = interpolate_eem(eem)
+            eem = smooth_eem(eem)
+            eem = remove_spikes(eem)
+            eem = raman_normalize(eem)
+
+            regions, HIX_norm = calc_features(eem)
+
+            # ⭐ 新增：自动解析 PS / KOH / MW
+            PS, KOH, Microwave = parse_sample_conditions(sample_label)
+
+            row = [sample_label, PS, KOH, Microwave, HIX_norm] + \
+                  [regions[f"R{i}"] for i in range(1, 6)]
+            results.append(row)
+
+        except Exception:
+            results.append([sample_label, 0, 0, 0, np.nan] + [np.nan] * 5)
+
+    df = pd.DataFrame(results,
+                      columns=["Sample", "PS", "KOH", "Microwave", "HIX_normalized",
+                               "R1", "R2", "R3", "R4", "R5"])
+
+    df = df.dropna(subset=["HIX_normalized"])
+
+    # 均值填补
+    for col in ["R1", "R2", "R3", "R4", "R5"]:
+        df[col] = df[col].fillna(df[col].mean())
+
+    df = df.dropna()
+
+    scaler = StandardScaler()
+    standard_cols = ["R1", "R2", "R3", "R4", "R5", "PS", "KOH", "Microwave"]
+    df[standard_cols] = scaler.fit_transform(df[standard_cols])
+
+    save_path = os.path.join(save_folder, "HIX2.csv")
+    df.to_csv(save_path, index=False, encoding="utf-8-sig")
+
+    print(f"\n✅ CSV 已生成，可用于机器学习：{save_path}")
