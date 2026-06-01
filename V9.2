@@ -1,0 +1,277 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+# =============== 配置 ===============
+FOLDER = r"E:\桌面\0"   # <- 修改为你的 EEM 文件夹
+SAVE_FOLDER = os.path.join(FOLDER, "ML_ready")
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# =============== 读取 Hitachi EEM ===============
+def read_hitachi_eem(filepath):
+    """从 Hitachi 导出的 txt 中读取 Ex/Em/Intensity 并返回 DataFrame (Ex index, Em columns)"""
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"⚠ 无法打开文件 {filepath}: {e}")
+        return pd.DataFrame()
+
+    # 找到 "Peaks" 标识行（这个是你原代码的逻辑）
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+    if start_idx is None:
+        # 如果没有找到 Peaks，就尝试从头解析可能的三列数据
+        start_idx = 0
+
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1].replace(',', '').strip()
+            intensity = float(parts[2])
+            # try ex/em split
+            if '/' in ex_em:
+                ex, em = ex_em.split('/')
+            elif '\\' in ex_em:
+                ex, em = ex_em.split('\\')
+            else:
+                ex = parts[0]
+                em = parts[1]
+            data.append([float(ex), float(em), intensity])
+        except Exception:
+            # 忽略解析失败的行
+            continue
+
+    if len(data) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    try:
+        eem.index = eem.index.astype(float)
+        eem.columns = eem.columns.astype(float)
+    except Exception:
+        pass
+    return eem.sort_index(axis=0).sort_index(axis=1)
+
+# =============== 计算 R1-R5 与 HIX ===============
+def calc_features(eem):
+    """返回 regions dict 和 HIX_normalized"""
+    if eem.empty:
+        return {f"R{i}": np.nan for i in range(1, 6)}, np.nan
+
+    def mean_region(eem, ex_range, em_range):
+        sub = eem.loc[
+            (eem.index >= ex_range[0]) & (eem.index <= ex_range[1]),
+            (eem.columns >= em_range[0]) & (eem.columns <= em_range[1])
+        ]
+        if sub.empty or sub.stack().dropna().empty:
+            return np.nan
+        return sub.mean().mean()
+
+    regions = {
+        "R1": mean_region(eem, (200, 250), (250, 330)),
+        "R2": mean_region(eem, (200, 250), (330, 380)),
+        "R3": mean_region(eem, (200, 250), (380, 550)),
+        "R4": mean_region(eem, (250, 380), (250, 380)),
+        "R5": mean_region(eem, (250, 450), (380, 550)),
+    }
+
+    # HIX 以 Ex = 254 行计算，若无则插值或选择最近行
+    ex_target = 254
+    try:
+        if ex_target in eem.index:
+            row = eem.loc[ex_target]
+        else:
+            eem_interp = eem.reindex(eem.index.union([ex_target])).sort_index()
+            eem_interp = eem_interp.interpolate(method='index', axis=0, limit_direction='both')
+            row = eem_interp.loc[ex_target]
+    except Exception:
+        # fallback to nearest existing Ex
+        diffs = np.abs(eem.index.to_numpy() - ex_target)
+        nearest_ex = eem.index.to_numpy()[np.argmin(diffs)]
+        row = eem.loc[nearest_ex]
+
+    low_vals = row[(row.index >= 300) & (row.index <= 345)].dropna()
+    high_vals = row[(row.index >= 435) & (row.index <= 480)].dropna()
+    if low_vals.empty or high_vals.empty:
+        return regions, np.nan
+
+    low_sum = low_vals.sum()
+    high_sum = high_vals.sum()
+    if (low_sum + high_sum) == 0:
+        return regions, np.nan
+
+    HIX_norm = high_sum / (low_sum + high_sum)
+    return regions, HIX_norm
+
+# =============== 更稳健的样品名解析 ===============
+def parse_sample_conditions(sample_label):
+    """
+    从样品名解析 PS, KOH, Microwave（支持中文/英文多格式）。
+    若判为“原样/对照/未加药/blank”等，返回 (0,0,0)。
+    """
+    s = sample_label.strip()
+    s_lower = s.lower()
+
+    # 常见中文/英文表示“原样/未加药/对照/blank”的关键词
+    no_add_keywords = ["原样", "未加", "对照", "blank", "control", "raw", "原样-", "原样_"]
+    for kw in no_add_keywords:
+        if kw in s_lower:
+            return 0.0, 0.0, 0.0
+
+    PS = 0.0
+    KOH = 0.0
+    MW = 0.0
+
+    # 优先匹配关键词式：PS10, PS=10, PS_10, KOH20, MW5, Microwave5 等（支持小数）
+    m = re.search(r"ps[_\s\-:=]*([0-9]+\.?[0-9]*)", s, flags=re.IGNORECASE)
+    if m:
+        PS = float(m.group(1))
+    m = re.search(r"koh[_\s\-:=]*([0-9]+\.?[0-9]*)", s, flags=re.IGNORECASE)
+    if m:
+        KOH = float(m.group(1))
+    m = re.search(r"(mw|microwave)[_\s\-:=]*([0-9]+\.?[0-9]*)", s, flags=re.IGNORECASE)
+    if m:
+        MW = float(m.group(2))
+
+    # 退而求其次：如果上面都未识别，但样本名像 10+20+5 或 10_20_5 或 10-20-5，把三数字按顺序视为 PS,KOH,MW
+    if PS == 0 and KOH == 0 and MW == 0:
+        m = re.search(r'(\d+\.?\d*)[\+_\-\s]+(\d+\.?\d*)[\+_\-\s]+(\d+\.?\d*)', s)
+        if m:
+            try:
+                PS = float(m.group(1))
+                KOH = float(m.group(2))
+                MW = float(m.group(3))
+            except:
+                pass
+
+    # 最后，如果样本名只有一个数字并且没有关键词，我们**不**把它当成 PS（因为很多样本名会包含批次号）
+    # 保持 PS/KOH/MW 为 0，这样可以避免误把批次号当做剂量。
+    return PS, KOH, MW
+
+# =============== 异常值检测替换 ===============
+def detect_outliers(series):
+    Q1 = series.quantile(0.25)
+    Q3 = series.quantile(0.75)
+    IQR = Q3 - Q1
+    lower = Q1 - 1.5 * IQR
+    upper = Q3 + 1.5 * IQR
+    return series[(series < lower) | (series > upper)]
+
+def handle_outliers(df, features):
+    for f in features:
+        if f not in df.columns:
+            continue
+        outliers = detect_outliers(df[f])
+        if not outliers.empty:
+            median_val = df[f].median()
+            df.loc[outliers.index, f] = median_val
+    return df
+
+# =============== 主流程 ===============
+if __name__ == "__main__":
+    results = []
+
+    files = [f for f in os.listdir(FOLDER) if f.lower().endswith(".txt")]
+    print(f"Found {len(files)} .txt files in {FOLDER}")
+
+    for file in files:
+        path = os.path.join(FOLDER, file)
+        sample_label = os.path.splitext(file)[0]
+
+        try:
+            eem = read_hitachi_eem(path)
+            regions, HIX_norm = calc_features(eem)
+            PS, KOH, Microwave = parse_sample_conditions(sample_label)
+            row = [sample_label, PS, KOH, Microwave, HIX_norm] + [regions[f"R{i}"] for i in range(1, 6)]
+            results.append(row)
+        except Exception as e:
+            # 若单文件失败，记录并继续
+            print(f"⚠ Error processing {file}: {e}")
+            results.append([sample_label, 0.0, 0.0, 0.0, np.nan] + [np.nan]*5)
+
+    # =============== 构建 DataFrame ===============
+    df = pd.DataFrame(results, columns=["Sample", "PS", "KOH", "Microwave", "HIX_normalized", "R1", "R2", "R3", "R4", "R5"])
+
+    # =============== 诊断输出 ===============
+    print("------------ Diagnostic ------------")
+    print("Total rows:", df.shape[0])
+    print("HIX NaN count:", df['HIX_normalized'].isna().sum())
+    zero_count = ((df["PS"] == 0) & (df["KOH"] == 0) & (df["Microwave"] == 0)).sum()
+    print("PS=KOH=MW=0 count:", zero_count)
+
+    # 列出含数字但被判 0/0/0 的样本（提示可能需要手动检查）
+    suspicious = []
+    for name, ps, koh, mw, *_ in results:
+        if re.search(r'\d', name) and ps == 0 and koh == 0 and mw == 0:
+            suspicious.append(name)
+    print("Examples (<=20) of filenames containing digits but parsed as 0/0/0 (may be batch IDs):")
+    print("\n".join(suspicious[:20]) or "None")
+
+    # =============== 保存 debug 全样本（便于复查） ===============
+    debug_all_path = os.path.join(SAVE_FOLDER, "debug_all_samples.csv")
+    df.to_csv(debug_all_path, index=False, encoding="utf-8-sig")
+    print(f"Saved debug_all_samples.csv -> {debug_all_path}")
+
+    # =============== 处理 HIX 缺失 ===============
+    # 如果所有 HIX 都是 NaN，保存 debug 并 stop，避免后续报错
+    if df['HIX_normalized'].dropna().shape[0] == 0:
+        debug_path = os.path.join(SAVE_FOLDER, "debug_all_HIX_nan.csv")
+        df.to_csv(debug_path, index=False, encoding="utf-8-sig")
+        raise SystemExit(f"❌ All HIX values are NaN. Debug file saved: {debug_path}")
+
+    # 将 HIX 为 NaN 的样本保存到单独 CSV（便于后期手动检查），然后从训练集中移除
+    dropped_hix_df = df[df['HIX_normalized'].isna()]
+    if not dropped_hix_df.empty:
+        dropped_path = os.path.join(SAVE_FOLDER, "debug_dropped_HIX.csv")
+        dropped_hix_df.to_csv(dropped_path, index=False, encoding="utf-8-sig")
+        print(f"Saved dropped samples with NaN HIX -> {dropped_path}")
+    # 从后续处理移除 HIX=NaN 的行（因为目标缺失，无法用于回归）
+    df = df.dropna(subset=["HIX_normalized"]).reset_index(drop=True)
+
+    # =============== R1-R5 缺失值填补 ===============
+    for col in ["R1", "R2", "R3", "R4", "R5"]:
+        if col not in df.columns:
+            continue
+        if df[col].isna().all():
+            print(f"⚠ Warning: Column {col} is entirely NaN!")
+            # 保留列，但不填充
+        else:
+            df[col] = df[col].fillna(df[col].mean())
+
+    # =============== 异常值处理 ===============
+    feature_cols = ["R1", "R2", "R3", "R4", "R5", "HIX_normalized"]
+    df = handle_outliers(df, feature_cols)
+
+    # =============== 标准化（跳过恒定列） ===============
+    standard_cols = ["R1", "R2", "R3", "R4", "R5", "PS", "KOH", "Microwave"]
+    # 保证列在 DataFrame 中
+    standard_cols = [c for c in standard_cols if c in df.columns]
+
+    const_cols = []
+    for c in standard_cols:
+        if df[c].nunique() <= 1:
+            const_cols.append(c)
+            print(f"Info: column '{c}' is constant (nunique={df[c].nunique()}); skipping scaling for it.")
+
+    to_scale = [c for c in standard_cols if c not in const_cols]
+    if len(to_scale) > 0:
+        scaler = StandardScaler()
+        df[to_scale] = scaler.fit_transform(df[to_scale])
+    else:
+        print("Warning: no columns available for scaling (all constant). Skipping StandardScaler.")
+
+    # =============== 最终保存 ===============
+    save_path = os.path.join(SAVE_FOLDER, "HIX-1.csv")
+    df.to_csv(save_path, index=False, encoding="utf-8-sig")
+    print(f"\n✅ Preprocessed CSV saved: {save_path}")
+    print("You can now use this CSV for model training.")
