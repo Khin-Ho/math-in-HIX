@@ -1,0 +1,246 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+# =============== 配置 ===============
+FOLDER = r"E:\桌面\0"   # <- 修改为你的 EEM 文件夹
+SAVE_FOLDER = os.path.join(FOLDER, "ML_ready")
+os.makedirs(SAVE_FOLDER, exist_ok=True)
+
+# =============== 读取 Hitachi EEM ===============
+def read_hitachi_eem(filepath):
+    """从 Hitachi 导出的 txt 中读取 Ex/Em/Intensity 并返回 DataFrame (Ex index, Em columns)"""
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"⚠ 无法打开文件 {filepath}: {e}")
+        return pd.DataFrame()
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+    if start_idx is None:
+        start_idx = 0
+
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1].replace(',', '').strip()
+            intensity = float(parts[2])
+            if '/' in ex_em:
+                ex, em = ex_em.split('/')
+            elif '\\' in ex_em:
+                ex, em = ex_em.split('\\')
+            else:
+                ex = parts[0]
+                em = parts[1]
+            data.append([float(ex), float(em), intensity])
+        except Exception:
+            continue
+
+    if len(data) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    try:
+        eem.index = eem.index.astype(float)
+        eem.columns = eem.columns.astype(float)
+    except Exception:
+        pass
+    return eem.sort_index(axis=0).sort_index(axis=1)
+
+# =============== 计算 R1-R5 与 HIX ===============
+def calc_features(eem):
+    """返回 regions dict 和 HIX_normalized"""
+    if eem.empty:
+        return {f"R{i}": np.nan for i in range(1, 6)}, np.nan
+
+    def mean_region(eem, ex_range, em_range):
+        sub = eem.loc[
+            (eem.index >= ex_range[0]) & (eem.index <= ex_range[1]),
+            (eem.columns >= em_range[0]) & (eem.columns <= em_range[1])
+        ]
+        if sub.empty or sub.stack().dropna().empty:
+            return np.nan
+        return sub.mean().mean()
+
+    regions = {
+        "R1": mean_region(eem, (200, 250), (250, 330)),
+        "R2": mean_region(eem, (200, 250), (330, 380)),
+        "R3": mean_region(eem, (200, 250), (380, 550)),
+        "R4": mean_region(eem, (250, 380), (250, 380)),
+        "R5": mean_region(eem, (250, 450), (380, 550)),
+    }
+
+    ex_target = 254
+    try:
+        if ex_target in eem.index:
+            row = eem.loc[ex_target]
+        else:
+            eem_interp = eem.reindex(eem.index.union([ex_target])).sort_index()
+            eem_interp = eem_interp.interpolate(method='index', axis=0, limit_direction='both')
+            row = eem_interp.loc[ex_target]
+    except Exception:
+        diffs = np.abs(eem.index.to_numpy() - ex_target)
+        nearest_ex = eem.index.to_numpy()[np.argmin(diffs)]
+        row = eem.loc[nearest_ex]
+
+    low_vals = row[(row.index >= 300) & (row.index <= 345)].dropna()
+    high_vals = row[(row.index >= 435) & (row.index <= 480)].dropna()
+    if low_vals.empty or high_vals.empty:
+        return regions, np.nan
+
+    low_sum = low_vals.sum()
+    high_sum = high_vals.sum()
+    if (low_sum + high_sum) == 0:
+        return regions, np.nan
+
+    HIX_norm = high_sum / (low_sum + high_sum)
+    return regions, HIX_norm
+
+# =============== 样品名解析 ===============
+def parse_sample_conditions(sample_label):
+    s = sample_label.strip()
+    s_lower = s.lower()
+    no_add_keywords = ["原样", "未加", "对照", "blank", "control", "raw", "原样-", "原样_"]
+    for kw in no_add_keywords:
+        if kw in s_lower:
+            return 0.0, 0.0, 0.0
+
+    PS = 0.0
+    KOH = 0.0
+    MW = 0.0
+
+    m = re.search(r"ps[_\s\-:=]*([0-9]+\.?[0-9]*)", s, flags=re.IGNORECASE)
+    if m:
+        PS = float(m.group(1))
+    m = re.search(r"koh[_\s\-:=]*([0-9]+\.?[0-9]*)", s, flags=re.IGNORECASE)
+    if m:
+        KOH = float(m.group(1))
+    m = re.search(r"(mw|microwave)[_\s\-:=]*([0-9]+\.?[0-9]*)", s, flags=re.IGNORECASE)
+    if m:
+        MW = float(m.group(2))
+
+    if PS == 0 and KOH == 0 and MW == 0:
+        m = re.search(r'(\d+\.?\d*)[\+_\-\s]+(\d+\.?\d*)[\+_\-\s]+(\d+\.?\d*)', s)
+        if m:
+            try:
+                PS = float(m.group(1))
+                KOH = float(m.group(2))
+                MW = float(m.group(3))
+            except:
+                pass
+    return PS, KOH, MW
+
+# =============== 异常值处理 ===============
+def detect_outliers(series):
+    Q1 = series.quantile(0.25)
+    Q3 = series.quantile(0.75)
+    IQR = Q3 - Q1
+    lower = Q1 - 1.5 * IQR
+    upper = Q3 + 1.5 * IQR
+    return series[(series < lower) | (series > upper)]
+
+def handle_outliers(df, features):
+    for f in features:
+        if f not in df.columns:
+            continue
+        outliers = detect_outliers(df[f])
+        if not outliers.empty:
+            median_val = df[f].median()
+            df.loc[outliers.index, f] = median_val
+    return df
+
+# =============== 主流程 ===============
+if __name__ == "__main__":
+    results = []
+
+    files = [f for f in os.listdir(FOLDER) if f.lower().endswith(".txt")]
+    print(f"Found {len(files)} .txt files in {FOLDER}")
+
+    for file in files:
+        path = os.path.join(FOLDER, file)
+        sample_label = os.path.splitext(file)[0]
+
+        try:
+            eem = read_hitachi_eem(path)
+            regions, HIX_norm = calc_features(eem)
+            PS, KOH, MW = parse_sample_conditions(sample_label)
+
+            # 对原样样品添加微扰动，避免全为0导致模型归一类
+            if PS == 0 and KOH == 0 and MW == 0:
+                PS += np.random.uniform(-0.001, 0.001)
+                KOH += np.random.uniform(-0.001, 0.001)
+                MW += np.random.uniform(-0.001, 0.001)
+
+            row = [sample_label, PS, KOH, MW, HIX_norm] + [regions[f"R{i}"] for i in range(1, 6)]
+            results.append(row)
+        except Exception as e:
+            print(f"⚠ Error processing {file}: {e}")
+            results.append([sample_label, 0.0, 0.0, 0.0, np.nan] + [np.nan]*5)
+
+    df = pd.DataFrame(results, columns=["Sample", "PS", "KOH", "Microwave", "HIX_normalized", "R1", "R2", "R3", "R4", "R5"])
+
+    # 诊断输出
+    print("------------ Diagnostic ------------")
+    print("Total rows:", df.shape[0])
+    print("HIX NaN count:", df['HIX_normalized'].isna().sum())
+    zero_count = ((df["PS"] == 0) & (df["KOH"] == 0) & (df["Microwave"] == 0)).sum()
+    print("PS=KOH=MW=0 count:", zero_count)
+
+    # 保存 debug 全样本
+    debug_all_path = os.path.join(SAVE_FOLDER, "debug_all_samples.csv")
+    df.to_csv(debug_all_path, index=False, encoding="utf-8-sig")
+    print(f"Saved debug_all_samples.csv -> {debug_all_path}")
+
+    # 处理 HIX 缺失
+    if df['HIX_normalized'].dropna().shape[0] == 0:
+        debug_path = os.path.join(SAVE_FOLDER, "debug_all_HIX_nan.csv")
+        df.to_csv(debug_path, index=False, encoding="utf-8-sig")
+        raise SystemExit(f"❌ All HIX values are NaN. Debug file saved: {debug_path}")
+
+    dropped_hix_df = df[df['HIX_normalized'].isna()]
+    if not dropped_hix_df.empty:
+        dropped_path = os.path.join(SAVE_FOLDER, "debug_dropped_HIX.csv")
+        dropped_hix_df.to_csv(dropped_path, index=False, encoding="utf-8-sig")
+        print(f"Saved dropped samples with NaN HIX -> {dropped_path}")
+    df = df.dropna(subset=["HIX_normalized"]).reset_index(drop=True)
+
+    # R1-R5 缺失值填补
+    for col in ["R1", "R2", "R3", "R4", "R5"]:
+        if col not in df.columns:
+            continue
+        if df[col].isna().all():
+            print(f"⚠ Warning: Column {col} is entirely NaN!")
+        else:
+            df[col] = df[col].fillna(df[col].mean())
+
+    # 异常值处理
+    feature_cols = ["R1", "R2", "R3", "R4", "R5", "HIX_normalized"]
+    df = handle_outliers(df, feature_cols)
+
+    # 标准化（跳过恒定列）
+    standard_cols = ["R1", "R2", "R3", "R4", "R5", "PS", "KOH", "Microwave"]
+    standard_cols = [c for c in standard_cols if c in df.columns]
+    const_cols = [c for c in standard_cols if df[c].nunique() <= 1]
+    to_scale = [c for c in standard_cols if c not in const_cols]
+    if len(to_scale) > 0:
+        scaler = StandardScaler()
+        df[to_scale] = scaler.fit_transform(df[to_scale])
+    else:
+        print("Warning: no columns available for scaling (all constant). Skipping StandardScaler.")
+
+    # 最终保存
+    save_path = os.path.join(SAVE_FOLDER, "HIX-4.csv")
+    df.to_csv(save_path, index=False, encoding="utf-8-sig")
+    print(f"\n✅ Preprocessed CSV saved: {save_path}")
+    print("You can now use this CSV for model training.")
