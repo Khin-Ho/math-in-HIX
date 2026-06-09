@@ -1,0 +1,248 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib
+
+# 強制使用 'Agg' 後端，解決 PyCharm 報錯問題
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.preprocessing import StandardScaler
+
+
+# =========================
+# 1. 讀取函數 (直接使用你原本能跑通的代碼)
+# =========================
+def read_hitachi_eem(filepath):
+    # 使用你原本的讀取邏輯，確保能讀到數據
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+    start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("Peaks"):
+            start_idx = i + 2
+            break
+    if start_idx is None:
+        # print(f"調試: {os.path.basename(filepath)} 未找到 'Peaks' 關鍵字")
+        return pd.DataFrame()
+    data = []
+    for line in lines[start_idx:]:
+        parts = re.split(r'\s+', line.strip())
+        if len(parts) < 3:
+            continue
+        try:
+            ex_em = parts[1].replace(',', '').strip()
+            intensity = float(parts[2])
+            if '/' in ex_em:
+                ex, em = ex_em.split('/')
+            elif '\\' in ex_em:
+                ex, em = ex_em.split('\\')
+            else:
+                ex = parts[0]
+                em = parts[1]
+            data.append([float(ex), float(em), intensity])
+        except Exception:
+            continue
+    if len(data) == 0:
+        return pd.DataFrame()
+    df = pd.DataFrame(data, columns=['Ex', 'Em', 'Intensity'])
+    eem = df.pivot_table(index='Ex', columns='Em', values='Intensity', aggfunc='mean')
+    eem.index = eem.index.astype(float)
+    eem.columns = eem.columns.astype(float)
+    return eem.sort_index(axis=0).sort_index(axis=1)
+
+
+# =========================
+# 2. 去除散射 + 計算特徵 (優化版)
+# =========================
+def remove_scattering(eem, width=15):
+    """將瑞利散射區域設為 NaN"""
+    clean = eem.copy()
+    exs = clean.index.values
+    ems = clean.columns.values
+    # 遍歷處理 (保持穩定性)
+    for ex in exs:
+        for em in ems:
+            if abs(em - ex) <= width:  # 1st order
+                clean.loc[ex, em] = np.nan
+            if abs(em - 2 * ex) <= width:  # 2nd order
+                clean.loc[ex, em] = np.nan
+    return clean
+
+
+def calc_features(eem):
+    # 1. 核心步驟：去除散射
+    eem = remove_scattering(eem, width=15)
+
+    if eem.empty:
+        return {f"R{i}": np.nan for i in range(1, 6)}, np.nan
+
+    # 2. 使用 nanmean 計算區域
+    def mean_region(eem, ex_range, em_range):
+        sub = eem.loc[
+            (eem.index >= ex_range[0]) & (eem.index <= ex_range[1]),
+            (eem.columns >= em_range[0]) & (eem.columns <= em_range[1])
+        ]
+        if sub.empty or sub.isnull().all().all():  # 全是 NaN
+            return np.nan
+        return np.nanmean(sub.values)
+
+    regions = {
+        "R1": mean_region(eem, (200, 250), (250, 330)),
+        "R2": mean_region(eem, (200, 250), (330, 380)),
+        "R3": mean_region(eem, (200, 250), (380, 550)),
+        "R4": mean_region(eem, (250, 380), (250, 380)),
+        "R5": mean_region(eem, (250, 450), (380, 550)),
+    }
+
+    # 3. 計算 HIX (兼容 NaN)
+    try:
+        ex_target = 254
+        # 找最近 Ex
+        idx = np.abs(eem.index.values - ex_target).argmin()
+        row = eem.iloc[idx]
+
+        low = row[(row.index >= 300) & (row.index <= 345)]
+        high = row[(row.index >= 435) & (row.index <= 480)]
+
+        l_val = np.nanmean(low) if not low.isnull().all() else 0
+        h_val = np.nanmean(high) if not high.isnull().all() else 0
+
+        if (l_val + h_val) == 0:
+            hix = np.nan
+        else:
+            hix = h_val / (l_val + h_val)
+    except:
+        hix = np.nan
+
+    return regions, hix
+
+
+def parse_sample_conditions(sample_label):
+    PS, KOH, Microwave = 0, 0, 0
+    pattern = r'(\d+\.?\d*)\+(\d+\.?\d*)(?:\+(\d+\.?\d*))?'
+    match = re.search(pattern, sample_label)
+    if match:
+        PS = float(match.group(1))
+        KOH = float(match.group(2))
+        Microwave = float(match.group(3)) if match.group(3) else 0
+    return PS, KOH, Microwave
+
+
+# =========================
+# 3. 主程序
+# =========================
+if __name__ == "__main__":
+    folder = r"E:\桌面\0"  # 請確認這個路徑有文件
+    save_folder = os.path.join(folder, "ML_ready_V2")
+    os.makedirs(save_folder, exist_ok=True)
+
+    results = []
+    print(f"正在讀取文件夾: {folder}")
+
+    file_list = [f for f in os.listdir(folder) if f.lower().endswith(".txt")]
+    print(f"找到 {len(file_list)} 個 txt 文件")
+
+    for i, file in enumerate(file_list):
+        path = os.path.join(folder, file)
+        sample_label = os.path.splitext(file)[0]
+
+        try:
+            eem = read_hitachi_eem(path)
+            if eem.empty:
+                print(f"警告: {file} 讀取為空，跳過")
+                continue
+
+            regions, HIX_norm = calc_features(eem)
+            PS, KOH, Microwave = parse_sample_conditions(sample_label)
+
+            # 數據微擾動 (防止全 0 報錯)
+            if PS == 0 and KOH == 0 and Microwave == 0:
+                PS += np.random.uniform(-0.001, 0.001)
+
+            row = [sample_label, PS, KOH, Microwave, HIX_norm] + [regions[f"R{i}"] for i in range(1, 6)]
+            results.append(row)
+
+            if i % 20 == 0: print(f"已處理 {i}/{len(file_list)}: {sample_label} -> HIX={HIX_norm:.2f}")
+
+        except Exception as e:
+            print(f"❌ {sample_label}: 出錯 -> {e}")
+
+    df = pd.DataFrame(results,
+                      columns=["Sample", "PS", "KOH", "Microwave", "HIX_normalized", "R1", "R2", "R3", "R4", "R5"])
+
+    # 處理缺失值
+    print(f"\n原始數據行數: {len(df)}")
+    df = df.dropna(subset=["HIX_normalized"])
+    print(f"去除 HIX 無效值後行數: {len(df)}")
+    df = df.fillna(df.mean(numeric_only=True))
+
+    # 保存清洗後的數據
+    df.to_csv(os.path.join(save_folder, "Data_Cleaned.csv"), index=False, encoding="utf-8-sig")
+
+    if len(df) < 10:
+        print("錯誤: 有效數據太少，無法進行機器學習。請檢查 EEM 文件格式或 'Peaks' 關鍵字。")
+        exit()
+
+    # =========================
+    # 4. 畫圖診斷 (保存為圖片)
+    # =========================
+    print("正在生成診斷圖 (Diagnosis_Plot.png)...")
+    plt.figure(figsize=(15, 5))
+
+    # 支持中文
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    plt.subplot(1, 3, 1)
+    sns.scatterplot(data=df, x='PS', y='HIX_normalized')
+    plt.title('PS vs HIX')
+
+    plt.subplot(1, 3, 2)
+    sns.scatterplot(data=df, x='KOH', y='HIX_normalized')
+    plt.title('KOH vs HIX')
+
+    plt.subplot(1, 3, 3)
+    sns.scatterplot(data=df, x='Microwave', y='HIX_normalized')
+    plt.title('Microwave vs HIX')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_folder, "Diagnosis_Plot.png"))  # 直接保存
+    print(f"圖片已保存至: {os.path.join(save_folder, 'Diagnosis_Plot.png')}")
+    plt.close()
+
+    # =========================
+    # 5. 機器學習 (Random Forest)
+    # =========================
+    print("正在運行機器學習...")
+
+    # 這裡只用條件預測結果，嚴禁使用 R1-R5 作為輸入
+    X = df[['PS', 'KOH', 'Microwave']]
+    y = df['HIX_normalized']
+
+    # 切分
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # 模型
+    rf = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42)
+    rf.fit(X_train, y_train)
+
+    # 預測
+    test_pred = rf.predict(X_test)
+    train_pred = rf.predict(X_train)
+
+    print("\n" + "=" * 30)
+    print("MODEL RESULTS (Random Forest)")
+    print("=" * 30)
+    print(f"Train R2: {r2_score(y_train, train_pred):.4f}")
+    print(f"Test R2:  {r2_score(y_test, test_pred):.4f}")
+    print(f"RMSE:     {np.sqrt(mean_squared_error(y_test, test_pred)):.4f}")
+
+    # 特徵重要性
+    imp = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
+    print("\n特徵重要性:")
+    print(imp)
